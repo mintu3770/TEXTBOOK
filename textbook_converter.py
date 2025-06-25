@@ -18,7 +18,7 @@ import time
 # =========================
 # GEMINI CONFIGURATION
 # =========================
-genai.configure(api_key="YOUR_GEMINI_API_KEY")
+genai.configure(api_key="AIzaSyBQC4WS3nxPaneINL3V1nuVsZd4QMa5Ra4")
 model = genai.GenerativeModel("gemini-pro")
 
 # ================
