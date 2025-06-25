@@ -1,45 +1,14 @@
-# textbook_converter.py
 import os
 import re
 import tempfile
 import base64
-import sys
-import subprocess
 import traceback
 from pathlib import Path
 import streamlit as st
 
-# Corrected package installation with proper import names
-required_packages = {
-    "python-pptx": "pptx",
-    "pymupdf": "fitz",
-    "reportlab": "reportlab",
-    "Pillow": "PIL"
-}
-
-def install_packages():
-    for package, import_name in required_packages.items():
-        try:
-            __import__(import_name)
-        except ImportError:
-            st.warning(f"Installing missing package: {package}")
-            try:
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", package],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                st.success(f"Successfully installed {package}")
-            except subprocess.CalledProcessError:
-                st.error(f"Failed to install {package}. Please install manually: pip install {package}")
-                st.stop()
-
-install_packages()
-
-# Now import the main libraries with additional safety
+# Import the main libraries
 try:
-    from pptx import Presentation
-    import fitz
+    import fitz  # PyMuPDF
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.platypus import (
@@ -48,10 +17,18 @@ try:
     )
     from reportlab.lib.units import inch
     from PIL import Image as PILImage
+    
+    # Try to import python-pptx but don't fail completely
+    try:
+        from pptx import Presentation
+        pptx_available = True
+    except ImportError:
+        pptx_available = False
+        st.warning("PPTX processing disabled. Install python-pptx for full functionality.")
+        
 except ImportError as e:
     st.error(f"Critical import failed: {str(e)}")
-    st.error("Please ensure all dependencies are installed:")
-    st.code("pip install python-pptx pymupdf reportlab Pillow")
+    st.error("Please ensure all dependencies are installed.")
     st.stop()
 
 # Set page config
@@ -86,7 +63,28 @@ def create_styles():
         fontName='Times-Roman',
         alignment=4
     ))
-    # ... (other styles remain the same) ...
+    styles.add(ParagraphStyle(
+        name='Heading1',
+        fontSize=16,
+        leading=18,
+        spaceAfter=12,
+        fontName='Times-Bold'
+    ))
+    styles.add(ParagraphStyle(
+        name='Heading2',
+        fontSize=14,
+        leading=16,
+        spaceAfter=8,
+        fontName='Times-BoldItalic'
+    ))
+    styles.add(ParagraphStyle(
+        name='Caption',
+        fontSize=9,
+        leading=11,
+        spaceAfter=12,
+        fontName='Times-Italic',
+        alignment=1
+    ))
     return styles
 
 # =====================
@@ -94,6 +92,10 @@ def create_styles():
 # =====================
 def extract_pptx(pptx_path, img_dir):
     """Extract text and images from PowerPoint files"""
+    if not pptx_available:
+        st.error("PPTX processing requires python-pptx which is not installed")
+        return []
+    
     try:
         prs = Presentation(pptx_path)
     except Exception as e:
@@ -101,7 +103,47 @@ def extract_pptx(pptx_path, img_dir):
         return []
     
     content = []
-    # ... (extraction logic remains the same) ...
+    
+    for slide_number, slide in enumerate(prs.slides):
+        slide_content = {"text": "", "images": []}
+        
+        # Extract text
+        text_elements = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for paragraph in shape.text_frame.paragraphs:
+                    text = ' '.join(run.text for run in paragraph.runs if run.text.strip())
+                    if text:
+                        text_elements.append(text)
+        
+        slide_content["text"] = clean_text("\n".join(text_elements))
+        
+        # Extract images
+        img_count = 0
+        for shape in slide.shapes:
+            if hasattr(shape, "image") and hasattr(shape.image, "blob"):
+                try:
+                    img = shape.image
+                    img_bytes = img.blob
+                    img_ext = img.ext
+                    img_path = img_dir / f"slide_{slide_number}_img_{img_count}.{img_ext}"
+                    
+                    with open(img_path, "wb") as f:
+                        f.write(img_bytes)
+                    
+                    # Validate image
+                    try:
+                        PILImage.open(img_path)
+                        slide_content["images"].append(str(img_path))
+                        img_count += 1
+                    except:
+                        st.warning(f"Skipped invalid image in slide {slide_number+1}")
+                        os.remove(img_path)
+                except Exception as e:
+                    st.warning(f"Failed to extract image: {str(e)}")
+        
+        content.append(slide_content)
+    
     return content
 
 def extract_pdf(pdf_path, img_dir):
@@ -113,7 +155,51 @@ def extract_pdf(pdf_path, img_dir):
         return []
     
     content = []
-    # ... (extraction logic remains the same) ...
+    
+    for page_number in range(len(doc)):
+        page = doc.load_page(page_number)
+        page_content = {"text": "", "images": []}
+        
+        # Extract text
+        try:
+            text = page.get_text()
+            page_content["text"] = clean_text(text)
+        except:
+            st.warning(f"Text extraction failed on page {page_number+1}")
+        
+        # Extract images
+        try:
+            img_list = page.get_images(full=True)
+            for img_index, img in enumerate(img_list):
+                try:
+                    xref = img[0]
+                    base_image = doc.extract_image(xref)
+                    img_bytes = base_image["image"]
+                    img_ext = base_image["ext"]
+                    
+                    # Handle JPEG2000 format
+                    if img_ext == "jp2":
+                        img_ext = "jpeg"
+                    
+                    img_path = img_dir / f"page_{page_number}_img_{img_index}.{img_ext}"
+                    
+                    with open(img_path, "wb") as f:
+                        f.write(img_bytes)
+                    
+                    # Validate image
+                    try:
+                        PILImage.open(img_path)
+                        page_content["images"].append(str(img_path))
+                    except:
+                        st.warning(f"Skipped invalid image on page {page_number+1}")
+                        os.remove(img_path)
+                except Exception as e:
+                    st.warning(f"Image extraction failed: {str(e)}")
+        except:
+            st.warning(f"Image extraction failed on page {page_number+1}")
+        
+        content.append(page_content)
+    
     return content
 
 # =====================
@@ -225,13 +311,14 @@ def create_textbook_pdf(content, output_path):
 def main():
     st.title("📚 Lecture to Textbook Converter")
     st.markdown("""
-    Convert your lecture slides (PPTX/PDF) into textbook-style PDFs for open-book exams.
+    Convert your lecture slides (PDF) into textbook-style PDFs for open-book exams.
+    PPTX support requires additional dependencies.
     """)
     
     with st.sidebar:
         st.header("How to Use")
         st.markdown("""
-        1. Upload PPTX or PDF lecture file
+        1. Upload PDF lecture file
         2. Click 'Convert to Textbook'
         3. Download your formatted PDF
         """)
@@ -248,11 +335,12 @@ def main():
         - Files >50MB may take longer to process
         - Complex layouts may not convert perfectly
         - Equations remain as images
+        - PPTX support requires manual dependency installation
         """)
     
     uploaded_file = st.file_uploader(
-        "Upload lecture file (PPTX or PDF)", 
-        type=["pptx", "pdf"],
+        "Upload lecture file (PDF preferred)", 
+        type=["pdf", "pptx"],
         accept_multiple_files=False
     )
     
