@@ -1,413 +1,255 @@
+# [all imports]
 import os
 import re
+import fitz
 import tempfile
-import base64
-import traceback
-from pathlib import Path
+from pptx import Presentation
+from PIL import Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Image as RLImage, Spacer, Preformatted, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.units import inch
+from reportlab.lib import colors
 import streamlit as st
+import google.generativeai as genai
+import time
 
-# Try to import required libraries
-try:
-    import fitz  # PyMuPDF
-    from reportlab.lib.pagesizes import letter
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, PageBreak, 
-        Image, Frame, PageTemplate
-    )
-    from reportlab.lib.units import inch
-    from PIL import Image as PILImage
-    
-    # Try to import python-pptx but don't fail completely
-    try:
-        from pptx import Presentation
-        pptx_available = True
-    except ImportError:
-        pptx_available = False
-        
-except ImportError as e:
-    st.error(f"Missing dependency: {str(e)}")
-    st.error("Please install required packages using:")
-    st.code("pip install pymupdf reportlab Pillow")
-    st.stop()
+# =========================
+# GEMINI CONFIGURATION
+# =========================
+genai.configure(api_key="YOUR_GEMINI_API_KEY")
+model = genai.GenerativeModel("gemini-pro")
 
-# Set page config
-st.set_page_config(
-    page_title="📚 Lecture to Textbook Converter",
-    page_icon="📚",
-    layout="centered",
-    initial_sidebar_state="expanded"
-)
+# ================
+# CHUNKING UTILITY
+# ================
+def chunk_text(text, max_len=1500):
+    words = text.split()
+    chunks = []
+    chunk = []
+    for word in words:
+        chunk.append(word)
+        if len(" ".join(chunk)) >= max_len:
+            chunks.append(" ".join(chunk))
+            chunk = []
+    if chunk:
+        chunks.append(" ".join(chunk))
+    return chunks
 
-# =====================
-# TEXT PROCESSING UTILS
-# =====================
-def clean_text(text):
-    """Normalize and clean extracted text"""
-    if not text:
-        return ""
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'•\s*', '\n• ', text)
-    text = re.sub(r'\b(\d+\.)\s+', r'\n\1 ', text)
-    text = re.sub(r'([.!?])([A-Z])', r'\1\n\2', text)
-    return text.strip()
+# ====================
+# GEMINI PROMPT LOGIC
+# ====================
+def call_gemini_prompt(raw_text, retries=3):
+    prompt = f"""
+You are a professional academic typesetter.
 
-def create_styles():
-    """Create textbook-like paragraph styles with unique names"""
+## Format Instructions:
+- Use `#`, `##`, `###` for heading levels: topics, subtopics, and sub-subtopics.
+- Maintain numbered sections like `1 INTRODUCTION`, `1.1 Motivation`, etc.
+- Keep paragraph breaks.
+- Wrap code with triple backticks.
+- Use Markdown tables where applicable.
+- Output only Markdown, nothing else.
+
+## Input Text:
+\"\"\"
+{raw_text}
+\"\"\"
+"""
+    for attempt in range(retries):
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            print(f"[Gemini Retry {attempt+1}] Error: {e}")
+            time.sleep(1 + attempt)
+    return raw_text
+
+def clean_text(raw_text):
+    chunks = chunk_text(raw_text)
+    return "\n\n".join(call_gemini_prompt(chunk) for chunk in chunks)
+
+# =========================
+# STYLES
+# =========================
+def create_styles(font_family='Times-Roman'):
     styles = getSampleStyleSheet()
-    
-    # Create custom styles with unique names
-    styles.add(ParagraphStyle(
-        name='TextbookHeading1',
-        fontSize=16,
-        leading=18,
-        spaceAfter=12,
-        fontName='Times-Bold'
-    ))
-    styles.add(ParagraphStyle(
-        name='TextbookHeading2',
-        fontSize=14,
-        leading=16,
-        spaceAfter=8,
-        fontName='Times-BoldItalic'
-    ))
-    styles.add(ParagraphStyle(
-        name='TextbookBody',
-        fontSize=10,
-        leading=14,
-        spaceAfter=6,
-        fontName='Times-Roman',
-        alignment=4  # Justified
-    ))
-    styles.add(ParagraphStyle(
-        name='TextbookCaption',
-        fontSize=9,
-        leading=11,
-        spaceAfter=12,
-        fontName='Times-Italic',
-        alignment=1  # Centered
-    ))
+    styles.add(ParagraphStyle(name='TextbookTitle', fontName=font_family, fontSize=20, alignment=TA_CENTER, spaceAfter=20))
+    styles.add(ParagraphStyle(name='TextbookHeading1', fontName=font_family, fontSize=16, spaceAfter=12, spaceBefore=12))
+    styles.add(ParagraphStyle(name='TextbookHeading2', fontName=font_family, fontSize=14, spaceAfter=10, spaceBefore=10))
+    styles.add(ParagraphStyle(name='TextbookHeading3', fontName=font_family, fontSize=12, spaceAfter=8, spaceBefore=8))
+    styles.add(ParagraphStyle(name='TextbookBody', fontName=font_family, fontSize=11, spaceAfter=6))
+    styles.add(ParagraphStyle(name='TextbookListItem', fontName=font_family, fontSize=11, leftIndent=20, spaceAfter=4))
+    styles.add(ParagraphStyle(name='TextbookItalic', fontName=font_family, fontSize=11, spaceAfter=6, italic=True))
+    styles.add(ParagraphStyle(name='TextbookCode', fontName='Courier', fontSize=10, leading=12, spaceAfter=8))
     return styles
 
+# =========================
+# MARKDOWN PARSER W/ TABLE SUPPORT
+# =========================
+def parse_markdown_to_flowables(text, styles):
+    flowables = []
+    in_code_block = False
+    code_lines = []
+    table_lines = []
+    in_table = False
+
+    for line in text.split("\n"):
+        line = line.rstrip()
+
+        # Code blocks
+        if line.strip().startswith("```"):
+            if not in_code_block:
+                in_code_block = True
+                code_lines = []
+            else:
+                in_code_block = False
+                flowables.append(Preformatted("\n".join(code_lines), styles["TextbookCode"]))
+        elif in_code_block:
+            code_lines.append(line)
+        # Table detection
+        elif "|" in line and re.match(r"^\|", line.strip()):
+            in_table = True
+            table_lines.append(line)
+        elif in_table and (not line.strip() or "---" not in line):
+            # Parse and end table
+            data = [re.split(r"\s*\|\s*", row.strip("| ")) for row in table_lines if row.strip()]
+            table = Table(data, hAlign="LEFT")
+            table.setStyle(TableStyle([
+                ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+                ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+                ('FONTNAME', (0,0), (-1,-1), 'Helvetica'),
+                ('FONTSIZE', (0,0), (-1,-1), 10),
+                ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ]))
+            flowables.append(table)
+            flowables.append(Spacer(1, 12))
+            in_table = False
+            table_lines = []
+            if line.strip():
+                flowables.append(Paragraph(line, styles["TextbookBody"]))
+        elif in_table:
+            table_lines.append(line)
+        # Headings and body
+        elif not line.strip():
+            flowables.append(Spacer(1, 12))
+        elif line.startswith("### "):
+            flowables.append(Paragraph(line[4:], styles["TextbookHeading3"]))
+        elif line.startswith("## "):
+            flowables.append(Paragraph(line[3:], styles["TextbookHeading2"]))
+        elif line.startswith("# "):
+            flowables.append(Paragraph(line[2:], styles["TextbookHeading1"]))
+        elif line.startswith("- "):
+            flowables.append(Paragraph(f"• {line[2:]}", styles["TextbookListItem"]))
+        elif re.match(r"^\d+\.", line):
+            flowables.append(Paragraph(line, styles["TextbookListItem"]))
+        elif line.startswith("**Note:**") or line.startswith("**Example:**"):
+            flowables.append(Paragraph(f"<i>{line}</i>", styles["TextbookItalic"]))
+        else:
+            flowables.append(Paragraph(line, styles["TextbookBody"]))
+    return flowables
+
 # =====================
-# CONTENT EXTRACTION
+# FILE EXTRACTION UTILS
 # =====================
-def extract_pptx(pptx_path, img_dir):
-    """Extract text and images from PowerPoint files"""
-    if not pptx_available:
-        st.error("PPTX processing requires python-pptx which is not installed")
-        return []
-    
-    try:
-        prs = Presentation(pptx_path)
-    except Exception as e:
-        st.error(f"Failed to open PPTX file: {str(e)}")
-        return []
-    
+def extract_pptx(pptx_path, img_dir, progress_bar=None, progress_text=None):
+    prs = Presentation(pptx_path)
     content = []
-    
-    for slide_number, slide in enumerate(prs.slides):
-        slide_content = {"text": "", "images": []}
-        
-        # Extract text
-        text_elements = []
+    for i, slide in enumerate(prs.slides):
+        slide_text = []
+        images = []
         for shape in slide.shapes:
-            if shape.has_text_frame:
-                for paragraph in shape.text_frame.paragraphs:
-                    text = ' '.join(run.text for run in paragraph.runs if run.text.strip())
-                    if text:
-                        text_elements.append(text)
-        
-        slide_content["text"] = clean_text("\n".join(text_elements))
-        
-        # Extract images
-        img_count = 0
-        for shape in slide.shapes:
-            if hasattr(shape, "image") and hasattr(shape.image, "blob"):
-                try:
-                    img = shape.image
-                    img_bytes = img.blob
-                    img_ext = img.ext
-                    img_path = img_dir / f"slide_{slide_number}_img_{img_count}.{img_ext}"
-                    
-                    with open(img_path, "wb") as f:
-                        f.write(img_bytes)
-                    
-                    # Validate image
-                    try:
-                        PILImage.open(img_path)
-                        slide_content["images"].append(str(img_path))
-                        img_count += 1
-                    except:
-                        st.warning(f"Skipped invalid image in slide {slide_number+1}")
-                        os.remove(img_path)
-                except Exception as e:
-                    st.warning(f"Failed to extract image: {str(e)}")
-        
-        content.append(slide_content)
-    
+            if hasattr(shape, "text"):
+                slide_text.append(shape.text)
+            if shape.shape_type == 13:
+                img = shape.image
+                img_bytes = img.blob
+                img_path = os.path.join(img_dir, f"slide_{i}.png")
+                with open(img_path, "wb") as f:
+                    f.write(img_bytes)
+                if os.path.getsize(img_path) > 20 * 1024:
+                    images.append(img_path)
+        content.append({"text": "\n".join(slide_text), "images": images})
+        if progress_bar:
+            progress_bar.progress((i + 1) / len(prs.slides))
     return content
 
-def extract_pdf(pdf_path, img_dir):
-    """Extract text and images from PDF files"""
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception as e:
-        st.error(f"Failed to open PDF file: {str(e)}")
-        return []
-    
+def extract_pdf(pdf_path, img_dir, progress_bar=None, progress_text=None):
+    doc = fitz.open(pdf_path)
     content = []
-    
-    for page_number in range(len(doc)):
-        page = doc.load_page(page_number)
-        page_content = {"text": "", "images": []}
-        
-        # Extract text
-        try:
-            text = page.get_text()
-            page_content["text"] = clean_text(text)
-        except:
-            st.warning(f"Text extraction failed on page {page_number+1}")
-        
-        # Extract images
-        try:
-            img_list = page.get_images(full=True)
-            for img_index, img in enumerate(img_list):
-                try:
-                    xref = img[0]
-                    base_image = doc.extract_image(xref)
-                    img_bytes = base_image["image"]
-                    img_ext = base_image["ext"]
-                    
-                    # Handle JPEG2000 format
-                    if img_ext == "jp2":
-                        img_ext = "jpeg"
-                    
-                    img_path = img_dir / f"page_{page_number}_img_{img_index}.{img_ext}"
-                    
-                    with open(img_path, "wb") as f:
-                        f.write(img_bytes)
-                    
-                    # Validate image
-                    try:
-                        PILImage.open(img_path)
-                        page_content["images"].append(str(img_path))
-                    except:
-                        st.warning(f"Skipped invalid image on page {page_number+1}")
-                        os.remove(img_path)
-                except Exception as e:
-                    st.warning(f"Image extraction failed: {str(e)}")
-        except:
-            st.warning(f"Image extraction failed on page {page_number+1}")
-        
-        content.append(page_content)
-    
+    for i, page in enumerate(doc):
+        text = page.get_text()
+        images = []
+        for img_index, img in enumerate(page.get_images(full=True)):
+            base_image = doc.extract_image(img[0])
+            image_bytes = base_image["image"]
+            img_path = os.path.join(img_dir, f"page_{i}_{img_index}.png")
+            with open(img_path, "wb") as f:
+                f.write(image_bytes)
+            if os.path.getsize(img_path) > 20 * 1024:
+                images.append(img_path)
+        content.append({"text": text, "images": images})
+        if progress_bar:
+            progress_bar.progress((i + 1) / len(doc))
     return content
 
 # =====================
-# PDF GENERATION
+# PDF CREATION FUNCTION
 # =====================
-def create_textbook_pdf(content, output_path):
-    """Generate textbook-style PDF with two-column layout"""
-    if not content:
-        st.error("No content to generate PDF")
-        return None
-    
-    try:
-        styles = create_styles()
-        # Convert Path object to string for ReportLab compatibility
-        doc = SimpleDocTemplate(
-            str(output_path),  # FIXED: Convert Path to string
-            pagesize=letter,
-            rightMargin=36,
-            leftMargin=36,
-            topMargin=36,
-            bottomMargin=36
-        )
-        
-        # Two-column layout
-        frame1 = Frame(
-            doc.leftMargin, 
-            doc.bottomMargin, 
-            doc.width/2 - 6, 
-            doc.height,
-            leftPadding=0,
-            bottomPadding=0,
-            rightPadding=12,
-            topPadding=0
-        )
-        frame2 = Frame(
-            doc.leftMargin + doc.width/2 + 6, 
-            doc.bottomMargin, 
-            doc.width/2 - 6, 
-            doc.height,
-            leftPadding=12,
-            bottomPadding=0,
-            rightPadding=0,
-            topPadding=0
-        )
-        
-        doc.addPageTemplates([PageTemplate(id='TwoCol', frames=[frame1, frame2])])
-        elements = []
-        
-        # Add title page
-        elements.append(Paragraph("Course Materials Textbook", styles['TextbookHeading1']))
-        elements.append(Spacer(1, 0.5*inch))
-        elements.append(Paragraph("Generated from Lecture Materials", styles['TextbookBody']))
-        elements.append(PageBreak())
-        
-        # Add content
-        for i, item in enumerate(content):
-            if i > 0:
-                elements.append(PageBreak())
-            
-            if item.get('text'):
-                # Use Heading2 style for any text containing "heading"
-                if "heading" in item['text'].lower()[:20]:
-                    elements.append(Paragraph(item['text'], styles['TextbookHeading2']))
-                    elements.append(Spacer(1, 0.1*inch))
-                else:
-                    text_paragraphs = item['text'].split('\n')
-                    for p in text_paragraphs:
-                        if p.strip():
-                            elements.append(Paragraph(p, styles['TextbookBody']))
-            
-            if item.get('images'):
-                for img_path in item['images']:
-                    elements.append(Spacer(1, 0.1*inch))
-                    try:
-                        img = PILImage.open(img_path)
-                        width, height = img.size
-                        aspect = width / height
-                        max_width = 3 * inch
-                        max_height = 2.5 * inch
-                        
-                        if width > max_width:
-                            height = max_width / aspect
-                            width = max_width
-                        if height > max_height:
-                            width = max_height * aspect
-                            height = max_height
-                            
-                        img.close()
-                        
-                        pdf_img = Image(img_path, width=width, height=height)
-                        pdf_img.hAlign = 'CENTER'
-                        elements.append(pdf_img)
-                        elements.append(Paragraph(
-                            f"Figure {i+1}: Relevant diagram", 
-                            styles['TextbookCaption']
-                        ))
-                        elements.append(Spacer(1, 0.2*inch))
-                    except Exception as e:
-                        st.warning(f"Skipped image: {img_path} - {str(e)}")
-        
-        doc.build(elements)
-        return output_path
-        
-    except Exception as e:
-        st.error(f"PDF generation failed: {str(e)}")
-        st.error("Please report this issue with the file you're trying to convert.")
-        return None
+def create_textbook_pdf(content, output_path, font_family='Times-Roman', progress_bar=None, progress_text=None):
+    styles = create_styles(font_family)
+    doc = SimpleDocTemplate(output_path, pagesize=A4, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=72)
+    story = []
+
+    for i, block in enumerate(content):
+        raw_text = block.get("text", "")
+        structured_text = clean_text(raw_text)
+        flowables = parse_markdown_to_flowables(structured_text, styles)
+        story.extend(flowables)
+
+        for img_path in block.get("images", []):
+            story.append(RLImage(img_path, width=4 * inch, height=3 * inch))
+            story.append(Spacer(1, 12))
+
+        if progress_bar:
+            progress_bar.progress((i + 1) / len(content))
+
+    doc.build(story)
 
 # =====================
-# STREAMLIT UI
+# STREAMLIT WEB INTERFACE
 # =====================
 def main():
-    st.title("📚 Lecture to Textbook Converter")
-    st.markdown("""
-    Convert your lecture slides (PDF or PPTX) into textbook-style PDFs for open-book exams.
-    """)
-    
-    with st.sidebar:
-        st.header("How to Use")
-        st.markdown("""
-        1. Upload lecture file (PDF or PPTX)
-        2. Click 'Convert to Textbook'
-        3. Download your formatted PDF
-        """)
-        st.markdown("---")
-        st.info("""
-        **Features:**
-        - Preserves all text content
-        - Extracts and resizes images
-        - Creates professional two-column layout
-        - Automatic heading detection
-        """)
-        
-        if not pptx_available:
-            st.warning("PPTX support requires python-pptx. Install with: pip install python-pptx")
-        
-        st.warning("""
-        **Note:** 
-        - Files >50MB may take longer to process
-        - Complex layouts may not convert perfectly
-        - Equations remain as images
-        """)
-    
-    uploaded_file = st.file_uploader(
-        "Upload lecture file (PDF or PPTX)", 
-        type=["pdf", "pptx"],
-        accept_multiple_files=False
-    )
-    
-    if uploaded_file:
-        if uploaded_file.size > 50 * 1024 * 1024:
-            st.error("File size exceeds 50MB limit")
-            return
-            
-        with st.spinner("Processing your file..."):
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                tmp_path = Path(tmp_dir)
-                input_path = tmp_path / uploaded_file.name
-                
-                try:
-                    with open(input_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                except Exception as e:
-                    st.error(f"File save failed: {str(e)}")
-                    return
-                
-                img_dir = tmp_path / "images"
-                img_dir.mkdir(exist_ok=True)
-                
-                try:
-                    if uploaded_file.name.lower().endswith('.pptx'):
-                        if not pptx_available:
-                            st.error("PPTX processing requires python-pptx. Install with: pip install python-pptx")
-                            return
-                        content = extract_pptx(input_path, img_dir)
-                    elif uploaded_file.name.lower().endswith('.pdf'):
-                        content = extract_pdf(input_path, img_dir)
-                    else:
-                        st.error("Unsupported file format")
-                        return
-                    
-                    if not content or all(len(item.get('text', '')) == 0 and len(item.get('images', [])) == 0 for item in content):
-                        st.error("No extractable content found in the file")
-                        return
-                    
-                    output_path = tmp_path / "textbook_output.pdf"
-                    if create_textbook_pdf(content, output_path):
-                        st.success("✅ Textbook generated successfully!")
-                        
-                        try:
-                            with open(output_path, "rb") as f:
-                                base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-                                pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
-                                st.markdown(pdf_display, unsafe_allow_html=True)
-                        except:
-                            st.warning("Preview unavailable. Please download the file.")
-                        
-                        st.download_button(
-                            label="Download Textbook PDF",
-                            data=open(output_path, "rb").read(),
-                            file_name="textbook_output.pdf",
-                            mime="application/pdf"
-                        )
-                except Exception as e:
-                    st.error(f"Processing error: {str(e)}")
-                    st.text(traceback.format_exc())
+    st.set_page_config(page_title="Textbook Converter", layout="centered")
+    st.title("📘 Lecture-to-Textbook Converter")
+
+    uploaded_file = st.file_uploader("Upload a PDF or PPTX lecture file", type=["pdf", "pptx"])
+    font_choice = st.selectbox("Choose a font", ["Times-Roman", "Helvetica", "Courier"])
+
+    if uploaded_file and st.button("Convert to Textbook"):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, uploaded_file.name)
+            with open(input_path, "wb") as f:
+                f.write(uploaded_file.read())
+
+            img_dir = os.path.join(tmpdir, "images")
+            os.makedirs(img_dir, exist_ok=True)
+
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+
+            if uploaded_file.name.endswith(".pdf"):
+                content = extract_pdf(input_path, img_dir, progress_bar, progress_text)
+            else:
+                content = extract_pptx(input_path, img_dir, progress_bar, progress_text)
+
+            output_path = os.path.join(tmpdir, "output_textbook.pdf")
+            create_textbook_pdf(content, output_path, font_choice, progress_bar, progress_text)
+
+            st.success("✅ Textbook PDF generated successfully!")
+            with open(output_path, "rb") as f:
+                st.download_button("📥 Download Textbook PDF", f, file_name="textbook.pdf", mime="application/pdf")
 
 if __name__ == "__main__":
     main()
