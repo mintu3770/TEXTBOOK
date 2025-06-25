@@ -6,7 +6,7 @@ import traceback
 from pathlib import Path
 import streamlit as st
 
-# Import the main libraries
+# Try to import required libraries
 try:
     import fitz  # PyMuPDF
     from reportlab.lib.pagesizes import letter
@@ -24,11 +24,11 @@ try:
         pptx_available = True
     except ImportError:
         pptx_available = False
-        st.warning("PPTX processing disabled. Install python-pptx for full functionality.")
         
 except ImportError as e:
-    st.error(f"Critical import failed: {str(e)}")
-    st.error("Please ensure all dependencies are installed.")
+    st.error(f"Missing dependency: {str(e)}")
+    st.error("Please install required packages using:")
+    st.code("pip install pymupdf reportlab Pillow")
     st.stop()
 
 # Set page config
@@ -53,37 +53,39 @@ def clean_text(text):
     return text.strip()
 
 def create_styles():
-    """Create textbook-like paragraph styles"""
+    """Create textbook-like paragraph styles with unique names"""
     styles = getSampleStyleSheet()
+    
+    # Create custom styles with unique names
     styles.add(ParagraphStyle(
-        name='Textbook',
-        fontSize=10,
-        leading=14,
-        spaceAfter=6,
-        fontName='Times-Roman',
-        alignment=4
-    ))
-    styles.add(ParagraphStyle(
-        name='Heading1',
+        name='TextbookHeading1',
         fontSize=16,
         leading=18,
         spaceAfter=12,
         fontName='Times-Bold'
     ))
     styles.add(ParagraphStyle(
-        name='Heading2',
+        name='TextbookHeading2',
         fontSize=14,
         leading=16,
         spaceAfter=8,
         fontName='Times-BoldItalic'
     ))
     styles.add(ParagraphStyle(
-        name='Caption',
+        name='TextbookBody',
+        fontSize=10,
+        leading=14,
+        spaceAfter=6,
+        fontName='Times-Roman',
+        alignment=4  # Justified
+    ))
+    styles.add(ParagraphStyle(
+        name='TextbookCaption',
         fontSize=9,
         leading=11,
         spaceAfter=12,
         fontName='Times-Italic',
-        alignment=1
+        alignment=1  # Centered
     ))
     return styles
 
@@ -213,8 +215,9 @@ def create_textbook_pdf(content, output_path):
     
     try:
         styles = create_styles()
+        # Convert Path object to string for ReportLab compatibility
         doc = SimpleDocTemplate(
-            output_path,
+            str(output_path),  # FIXED: Convert Path to string
             pagesize=letter,
             rightMargin=36,
             leftMargin=36,
@@ -248,9 +251,9 @@ def create_textbook_pdf(content, output_path):
         elements = []
         
         # Add title page
-        elements.append(Paragraph("Course Materials Textbook", styles['Heading1']))
+        elements.append(Paragraph("Course Materials Textbook", styles['TextbookHeading1']))
         elements.append(Spacer(1, 0.5*inch))
-        elements.append(Paragraph("Generated from Lecture Materials", styles['Textbook']))
+        elements.append(Paragraph("Generated from Lecture Materials", styles['TextbookBody']))
         elements.append(PageBreak())
         
         # Add content
@@ -259,14 +262,15 @@ def create_textbook_pdf(content, output_path):
                 elements.append(PageBreak())
             
             if item.get('text'):
+                # Use Heading2 style for any text containing "heading"
                 if "heading" in item['text'].lower()[:20]:
-                    elements.append(Paragraph(item['text'], styles['Heading2']))
+                    elements.append(Paragraph(item['text'], styles['TextbookHeading2']))
                     elements.append(Spacer(1, 0.1*inch))
                 else:
                     text_paragraphs = item['text'].split('\n')
                     for p in text_paragraphs:
                         if p.strip():
-                            elements.append(Paragraph(p, styles['Textbook']))
+                            elements.append(Paragraph(p, styles['TextbookBody']))
             
             if item.get('images'):
                 for img_path in item['images']:
@@ -292,7 +296,7 @@ def create_textbook_pdf(content, output_path):
                         elements.append(pdf_img)
                         elements.append(Paragraph(
                             f"Figure {i+1}: Relevant diagram", 
-                            styles['Caption']
+                            styles['TextbookCaption']
                         ))
                         elements.append(Spacer(1, 0.2*inch))
                     except Exception as e:
@@ -303,6 +307,7 @@ def create_textbook_pdf(content, output_path):
         
     except Exception as e:
         st.error(f"PDF generation failed: {str(e)}")
+        st.error("Please report this issue with the file you're trying to convert.")
         return None
 
 # =====================
@@ -311,14 +316,13 @@ def create_textbook_pdf(content, output_path):
 def main():
     st.title("📚 Lecture to Textbook Converter")
     st.markdown("""
-    Convert your lecture slides (PDF) into textbook-style PDFs for open-book exams.
-    PPTX support requires additional dependencies.
+    Convert your lecture slides (PDF or PPTX) into textbook-style PDFs for open-book exams.
     """)
     
     with st.sidebar:
         st.header("How to Use")
         st.markdown("""
-        1. Upload PDF lecture file
+        1. Upload lecture file (PDF or PPTX)
         2. Click 'Convert to Textbook'
         3. Download your formatted PDF
         """)
@@ -330,16 +334,19 @@ def main():
         - Creates professional two-column layout
         - Automatic heading detection
         """)
+        
+        if not pptx_available:
+            st.warning("PPTX support requires python-pptx. Install with: pip install python-pptx")
+        
         st.warning("""
         **Note:** 
         - Files >50MB may take longer to process
         - Complex layouts may not convert perfectly
         - Equations remain as images
-        - PPTX support requires manual dependency installation
         """)
     
     uploaded_file = st.file_uploader(
-        "Upload lecture file (PDF preferred)", 
+        "Upload lecture file (PDF or PPTX)", 
         type=["pdf", "pptx"],
         accept_multiple_files=False
     )
@@ -366,6 +373,9 @@ def main():
                 
                 try:
                     if uploaded_file.name.lower().endswith('.pptx'):
+                        if not pptx_available:
+                            st.error("PPTX processing requires python-pptx. Install with: pip install python-pptx")
+                            return
                         content = extract_pptx(input_path, img_dir)
                     elif uploaded_file.name.lower().endswith('.pdf'):
                         content = extract_pdf(input_path, img_dir)
@@ -373,8 +383,8 @@ def main():
                         st.error("Unsupported file format")
                         return
                     
-                    if not content:
-                        st.error("No extractable content found")
+                    if not content or all(len(item.get('text', '')) == 0 and len(item.get('images', [])) == 0 for item in content):
+                        st.error("No extractable content found in the file")
                         return
                     
                     output_path = tmp_path / "textbook_output.pdf"
